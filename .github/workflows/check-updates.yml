@@ -1,0 +1,112 @@
+name: Monitor Job Postings
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: 
+
+permissions:
+  contents: write  
+
+jobs:
+  check_updates:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Clone Public Repository
+        run: |
+          git clone --depth 1 --branch dev https://github.com/SimplifyJobs/Summer2025-Internships.git public-repo
+
+      - name: Extract Latest Job Postings
+        id: extract
+        run: |
+          cd public-repo
+          awk '/TABLE_START/{flag=1;next}/TABLE_END/{flag=0}flag' README.md | grep -v '🔒' > ../current_jobs.txt
+          cd ..
+
+      - name: Check Previous Jobs File
+        run: |
+          if [[ ! -f previous_jobs.txt ]]; then
+            touch previous_jobs.txt
+          fi
+
+      - name: Compare with Previous Job Postings
+        id: compare
+        run: |
+          new_jobs=$(diff --new-line-format="%L" --unchanged-line-format="" previous_jobs.txt current_jobs.txt || true)
+
+          if [[ -n "$new_jobs" ]]; then
+            echo "new_jobs=$(echo "$new_jobs" | base64 | tr -d '\n')" >> $GITHUB_ENV
+          else
+            echo "new_jobs=" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          cp current_jobs.txt previous_jobs.txt
+
+      - name: Commit Updated Previous Jobs
+        if: env.new_jobs
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add previous_jobs.txt
+          git commit -m "Update previous jobs list"
+          git push origin HEAD:main  
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send Discord Notification
+        if: env.new_jobs
+        run: |
+          new_jobs=$(echo "${{ env.new_jobs }}" | base64 --decode)
+          last_company=""
+          while IFS= read -r job; do
+            if [[ ! "$job" =~ ^\| ]]; then
+              continue
+            fi
+            link=$(echo "$job" | grep -oP '(?<=href=").*?(?=")' | grep -v 'https://simplify.jobs/c/' | head -1)
+            if [[ -z "$link" ]]; then
+              continue
+            fi
+            company=$(echo "$job" | awk -F '|' '{print $2}' | sed 's/\[\([^]]*\)\](.*simplify.jobs\/c\/[^)]*)/\1/' | xargs)
+            if [[ "$company" == "↳" ]]; then
+              company=$last_company
+            else
+              last_company=$company
+            fi
+            role=$(echo "$job" | awk -F '|' '{print $3}' | xargs)
+            location=$(echo "$job" | awk -F '|' '{print $4}' | sed 's/<\/\?br>/, /g' | sed 's/<\/\?details>//g' | sed 's/<\/\?summary>//g' | xargs)
+            location=$(echo "$location" | sed 's/^.* locations//' | xargs)
+            date=$(echo "$job" | awk -F '|' '{print $6}' | xargs)
+
+            embed=$(echo '{
+              "username": "Simplify Jobs",
+              "avatar_url": "https://avatars.githubusercontent.com/u/138842517",
+              "embeds": [{
+                "title": "'"${company} - ${role}"'",
+                "color": 65280,
+                "fields": [
+                  {"name": "🌍 Location", "value": "'"${location}"'", "inline": true},
+                  {"name": "📅 Date Posted", "value": "'"${date}"'", "inline": true},
+                  {"name": "💼 Application Link", "value": "[Apply Here]('"${link}"')", "inline": false}
+                ],
+                "footer": {
+                  "text": "Internship Notification",
+                  "icon_url": "https://avatars.githubusercontent.com/u/138842517"
+                },
+                "thumbnail": {
+                  "url": "https://avatars.githubusercontent.com/u/63759855"
+                }
+              }]
+            }')
+
+            curl -H "Content-Type: application/json" \
+                 -X POST \
+                 -d "$embed" \
+                 ${{ secrets.DISCORD_WEBHOOK }}
+          done <<< "$new_jobs"
